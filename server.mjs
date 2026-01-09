@@ -2,23 +2,58 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 import { OAuth2Client } from "google-auth-library";
 
 const app = express();
 
 /**
+ * ---- Request logging (shows up in Render Logs)
+ */
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
+  });
+  next();
+});
+
+/**
  * ---- Middleware
  */
+app.set("trust proxy", 1); // Render runs behind a proxy
+
 app.use(express.json({ limit: "200kb" }));
 app.use(helmet());
-app.use(cors({ origin: "*" })); // You can restrict later to your app domains if you want
+
+app.use(
+  cors({
+    origin: "*", // tighten later if you want
+  })
+);
+
+/**
+ * ---- Basic rate limiting (protects OpenAI + your service)
+ */
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 120, // 120 req/min per IP (safe default)
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
 /**
  * ---- Health
  */
 app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/healthz", (req, res) => res.status(200).json({ ok: true }));
+
+app.get("/healthz", (req, res) => {
+  console.log("✅ HIT /healthz");
+  res.status(200).json({ ok: true });
+});
 
 /**
  * ---- Env
@@ -103,7 +138,6 @@ function toNumberOrNull(v) {
 }
 
 function normalizeBillingPeriod(v) {
-  // Keep your iOS side flexible: "monthly" / "yearly" / "weekly" / etc
   if (typeof v !== "string") return null;
   const s = v.trim().toLowerCase();
   if (!s) return null;
@@ -115,7 +149,6 @@ function normalizeBillingPeriod(v) {
  * POST /v1/classifySubscription
  * Auth: Bearer <Google ID token>
  * Body: { subject, from, excerpt }
- * Response: SubscriptionClassification (snake_case keys)
  */
 app.post("/v1/classifySubscription", async (req, res) => {
   try {
@@ -163,7 +196,7 @@ Return JSON with exactly these keys:
 }
 
 Rules:
-- If NOT a subscription, set is_subscription=false and all others null (except billing_email may be null).
+- If NOT a subscription, set is_subscription=false and all others null.
 - currency should be like "USD", "CAD", "EUR" when possible.
 - billing_period should be like "monthly", "yearly", "weekly", "quarterly" if you can infer it.
 - is_apple_subscription true if it clearly looks like Apple/App Store billing, else false if clearly not, else null if unknown.
@@ -188,7 +221,9 @@ Rules:
       currency: typeof obj.currency === "string" ? obj.currency : null,
       billing_period: normalizeBillingPeriod(obj.billing_period),
       billing_email:
-        (typeof obj.billing_email === "string" && obj.billing_email.trim()) ? obj.billing_email.trim() : (userEmail || null),
+        typeof obj.billing_email === "string" && obj.billing_email.trim()
+          ? obj.billing_email.trim()
+          : userEmail || null,
       is_apple_subscription:
         typeof obj.is_apple_subscription === "boolean" ? obj.is_apple_subscription : null,
     });
@@ -230,4 +265,3 @@ app.post("/v1/deleteMyData", async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`✅ Server listening on port ${PORT}`));
-
