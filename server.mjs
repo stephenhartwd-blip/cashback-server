@@ -2,14 +2,14 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 import { OAuth2Client } from "google-auth-library";
 
 const app = express();
+app.set("trust proxy", 1); // Render is behind a proxy
 
 /**
- * ---- Request logging (shows up in Render Logs)
+ * ---- Request logging (shows in Render Logs)
  */
 app.use((req, res, next) => {
   const start = Date.now();
@@ -22,28 +22,9 @@ app.use((req, res, next) => {
 /**
  * ---- Middleware
  */
-app.set("trust proxy", 1); // Render runs behind a proxy
-
 app.use(express.json({ limit: "200kb" }));
 app.use(helmet());
-
-app.use(
-  cors({
-    origin: "*", // tighten later if you want
-  })
-);
-
-/**
- * ---- Basic rate limiting (protects OpenAI + your service)
- */
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    max: 120, // 120 req/min per IP (safe default)
-    standardHeaders: true,
-    legacyHeaders: false,
-  })
-);
+app.use(cors({ origin: "*" })); // tighten later if you want
 
 /**
  * ---- Health
@@ -149,6 +130,7 @@ function normalizeBillingPeriod(v) {
  * POST /v1/classifySubscription
  * Auth: Bearer <Google ID token>
  * Body: { subject, from, excerpt }
+ * Response: SubscriptionClassification (snake_case keys)
  */
 app.post("/v1/classifySubscription", async (req, res) => {
   try {
@@ -196,7 +178,7 @@ Return JSON with exactly these keys:
 }
 
 Rules:
-- If NOT a subscription, set is_subscription=false and all others null.
+- If NOT a subscription, set is_subscription=false and all others null (except billing_email may be null).
 - currency should be like "USD", "CAD", "EUR" when possible.
 - billing_period should be like "monthly", "yearly", "weekly", "quarterly" if you can infer it.
 - is_apple_subscription true if it clearly looks like Apple/App Store billing, else false if clearly not, else null if unknown.
