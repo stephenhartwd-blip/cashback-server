@@ -2,8 +2,8 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
-import { OAuth2Client } from "google-auth-library";
 
 const app = express();
 app.set("trust proxy", 1); // Render is behind a proxy
@@ -30,24 +30,17 @@ app.use(cors({ origin: "*" })); // tighten later if you want
  * ---- Health
  */
 app.get("/", (req, res) => res.status(200).send("ok"));
-
-app.get("/healthz", (req, res) => {
-  console.log("✅ HIT /healthz");
-  res.status(200).json({ ok: true });
-});
+app.get("/healthz", (req, res) => res.status(200).json({ ok: true }));
 
 /**
  * ---- Env
  */
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
 /**
- * ---- Clients
+ * ---- OpenAI client
  */
-const oauthClient = new OAuth2Client();
-
 function getOpenAIClient() {
   if (!OPENAI_API_KEY) {
     const err = new Error("Missing OPENAI_API_KEY on server (.env or Render env var).");
@@ -60,31 +53,9 @@ function getOpenAIClient() {
 /**
  * ---- Helpers
  */
-function safeTrim(s, n = 400) {
+function safeTrim(s, n = 600) {
   if (typeof s !== "string") return "";
   return s.length > n ? s.slice(0, n) + "…" : s;
-}
-
-function getBearerToken(req) {
-  const h = req.headers.authorization || "";
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : null;
-}
-
-async function verifyGoogleIdToken(idToken) {
-  if (!GOOGLE_CLIENT_ID) {
-    const err = new Error("Missing GOOGLE_CLIENT_ID on server (.env or Render env var).");
-    err.statusCode = 500;
-    throw err;
-  }
-
-  const ticket = await oauthClient.verifyIdToken({
-    idToken,
-    audience: GOOGLE_CLIENT_ID,
-  });
-
-  const payload = ticket.getPayload();
-  return payload || null;
 }
 
 function parseModelJSON(rawText) {
@@ -94,7 +65,7 @@ function parseModelJSON(rawText) {
   if (start === -1 || end === -1 || end <= start) {
     const err = new Error("AI did not return JSON");
     err.statusCode = 502;
-    err.raw = safeTrim(text, 400);
+    err.raw = safeTrim(text, 600);
     throw err;
   }
   const jsonStr = text.slice(start, end + 1);
@@ -104,7 +75,7 @@ function parseModelJSON(rawText) {
   } catch (e) {
     const err = new Error("AI returned invalid JSON");
     err.statusCode = 502;
-    err.raw = safeTrim(jsonStr, 400);
+    err.raw = safeTrim(jsonStr, 600);
     throw err;
   }
 }
@@ -118,75 +89,81 @@ function toNumberOrNull(v) {
   return null;
 }
 
-function normalizeBillingPeriod(v) {
-  if (typeof v !== "string") return null;
-  const s = v.trim().toLowerCase();
-  if (!s) return null;
-  return s;
+function clamp01(x) {
+  if (typeof x !== "number" || !Number.isFinite(x)) return 0.2;
+  return Math.max(0, Math.min(1, x));
+}
+
+function normCountryCode(v) {
+  const cc = (v || "US").toString().trim().toUpperCase();
+  return cc.slice(0, 2) || "US";
 }
 
 /**
- * ---- Routes
- * POST /v1/classifySubscription
- * Auth: Bearer <Google ID token>
- * Body: { subject, from, excerpt }
- * Response: SubscriptionClassification (snake_case keys)
+ * ---- Rate limits
  */
-app.post("/v1/classifySubscription", async (req, res) => {
+const priceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60, // 60 req/min per IP
+});
+
+const draftLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+});
+
+/**
+ * ---- Simple in-memory cache (24 hours) to reduce costs
+ * Keyed by: subscriptionName|countryCode
+ */
+const PRICE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const priceCache = new Map(); // key -> { expiresAt, value }
+
+/**
+ * POST /api/price-suggest
+ * Body: { subscriptionName: string, countryCode?: string }
+ * Returns: { monthly, currency, plan, confidence, notes, verifiedAt }
+ */
+app.post("/api/price-suggest", priceLimiter, async (req, res) => {
   try {
-    const idToken = getBearerToken(req);
-    if (!idToken) return res.status(401).json({ error: "Missing Authorization Bearer token" });
+    const subscriptionName = String(req.body?.subscriptionName || "").trim();
+    const countryCode = normCountryCode(req.body?.countryCode);
 
-    const payload = await verifyGoogleIdToken(idToken);
-    const userEmail = payload?.email || null;
-
-    const subject = String(req.body?.subject || "").trim();
-    const from = String(req.body?.from || "").trim();
-    const excerpt = String(req.body?.excerpt || "").trim();
-
-    if (!subject || !from || !excerpt) {
-      return res.status(400).json({
-        error: "Missing required fields",
-        required: ["subject", "from", "excerpt"],
-      });
+    if (!subscriptionName) {
+      return res.status(400).json({ error: "subscriptionName is required" });
     }
 
-    // Keep excerpt small / minimal (CASA-friendly)
-    const clippedExcerpt = excerpt.length > 800 ? excerpt.slice(0, 800) : excerpt;
+    const cacheKey = `${subscriptionName.toLowerCase()}|${countryCode}`;
+    const cached = priceCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return res.json({ ...cached.value, cacheHit: true });
+    }
 
     const prompt = `
-You are extracting subscription details from an email.
-Return ONLY a single JSON object (no markdown, no extra text).
+You estimate consumer subscription MONTHLY pricing by country.
 
-Email fields:
-- subject: ${JSON.stringify(subject)}
-- from: ${JSON.stringify(from)}
-- excerpt: ${JSON.stringify(clippedExcerpt)}
-
-Decide if this email indicates an active paid subscription or recurring billing.
-
-Return JSON with exactly these keys:
+Return ONLY a single JSON object (no markdown, no extra text) with exactly these keys:
 {
-  "is_subscription": boolean,
-  "subscription_name": string|null,
-  "merchant_name": string|null,
-  "price": number|null,
+  "monthly": number|null,
   "currency": string|null,
-  "billing_period": string|null,
-  "billing_email": string|null,
-  "is_apple_subscription": boolean|null
+  "plan": string|null,
+  "confidence": number,
+  "notes": string
 }
 
 Rules:
-- If NOT a subscription, set is_subscription=false and all others null (except billing_email may be null).
-- currency should be like "USD", "CAD", "EUR" when possible.
-- billing_period should be like "monthly", "yearly", "weekly", "quarterly" if you can infer it.
-- is_apple_subscription true if it clearly looks like Apple/App Store billing, else false if clearly not, else null if unknown.
-- price should be the recurring amount, not a one-time purchase.
+- If you are not confident, set monthly=null and confidence <= 0.30.
+- Use the most common individual plan price for that service in the given country.
+- If multiple tiers exist, pick the most popular tier and name it in "plan".
+- currency should be an ISO code like "USD", "CAD", "EUR", "GBP".
+- confidence must be 0.0 to 1.0.
+
+subscriptionName: ${JSON.stringify(subscriptionName)}
+countryCode: ${JSON.stringify(countryCode)}
 `.trim();
 
     const openai = getOpenAIClient();
-
     const response = await openai.responses.create({
       model: OPENAI_MODEL,
       input: prompt,
@@ -195,55 +172,111 @@ Rules:
     const raw = response.output_text || "";
     const obj = parseModelJSON(raw);
 
-    res.json({
-      is_subscription: !!obj.is_subscription,
-      subscription_name: typeof obj.subscription_name === "string" ? obj.subscription_name : null,
-      merchant_name: typeof obj.merchant_name === "string" ? obj.merchant_name : null,
-      price: toNumberOrNull(obj.price),
-      currency: typeof obj.currency === "string" ? obj.currency : null,
-      billing_period: normalizeBillingPeriod(obj.billing_period),
-      billing_email:
-        typeof obj.billing_email === "string" && obj.billing_email.trim()
-          ? obj.billing_email.trim()
-          : userEmail || null,
-      is_apple_subscription:
-        typeof obj.is_apple_subscription === "boolean" ? obj.is_apple_subscription : null,
-    });
+    const monthly = toNumberOrNull(obj.monthly);
+    const currency = typeof obj.currency === "string" ? obj.currency.trim().toUpperCase() : null;
+    const plan = typeof obj.plan === "string" ? obj.plan.trim() : null;
+    const confidence = clamp01(toNumberOrNull(obj.confidence));
+    const notes = typeof obj.notes === "string" ? safeTrim(obj.notes, 240) : "";
+
+    const payload = {
+      subscriptionName,
+      countryCode,
+      monthly: monthly != null && monthly >= 0 ? monthly : null,
+      currency: currency || null,
+      plan: plan || null,
+      confidence,
+      notes,
+      verifiedAt: new Date().toISOString(),
+      cacheHit: false,
+    };
+
+    priceCache.set(cacheKey, { expiresAt: now + PRICE_CACHE_TTL_MS, value: payload });
+
+    return res.json(payload);
   } catch (err) {
     const status = err?.statusCode || 500;
-    const message = String(err?.message || err);
-    const raw = err?.raw;
-
-    console.error("classifySubscription error:", err);
-
-    res.status(status).json({
-      error: status === 500 ? "Server error" : message,
-      message: status === 500 ? message : undefined,
-      raw: raw || undefined,
+    console.error("price-suggest error:", err);
+    return res.status(status).json({
+      error: status === 500 ? "Server error" : String(err?.message || err),
+      raw: err?.raw || undefined,
     });
   }
 });
 
 /**
- * POST /v1/deleteMyData
- * Auth: Bearer <Google ID token>
- * (You currently don’t store user data server-side, so this is just a verified ack.)
+ * POST /api/draft-cancel-email
+ * Body: { subscriptionName: string, userName?: string, accountEmail?: string, reason?: string }
+ * Returns: { subject, body }
  */
-app.post("/v1/deleteMyData", async (req, res) => {
+app.post("/api/draft-cancel-email", draftLimiter, async (req, res) => {
   try {
-    const idToken = getBearerToken(req);
-    if (!idToken) return res.status(401).json({ error: "Missing Authorization Bearer token" });
+    const subscriptionName = String(req.body?.subscriptionName || "").trim();
+    const userName = String(req.body?.userName || "").trim();
+    const accountEmail = String(req.body?.accountEmail || "").trim();
+    const reason = String(req.body?.reason || "").trim();
 
-    await verifyGoogleIdToken(idToken);
+    if (!subscriptionName) {
+      return res.status(400).json({ error: "subscriptionName is required" });
+    }
 
-    // If you later store derived subscription records, delete them here.
-    res.json({ ok: true, deleted: true });
+    const prompt = `
+You write short, clear cancellation emails.
+
+Return ONLY JSON:
+{
+  "subject": string,
+  "body": string
+}
+
+Context:
+- subscriptionName: ${JSON.stringify(subscriptionName)}
+- userName: ${JSON.stringify(userName || "")}
+- accountEmail: ${JSON.stringify(accountEmail || "")}
+- reason: ${JSON.stringify(reason || "")}
+
+Requirements:
+- Be polite, direct, and request confirmation in writing.
+- If accountEmail is provided, include it in the body.
+- If userName is provided, sign with it; otherwise sign "Customer".
+`.trim();
+
+    const openai = getOpenAIClient();
+    const response = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: prompt,
+    });
+
+    const raw = response.output_text || "";
+    const obj = parseModelJSON(raw);
+
+    const subject =
+      typeof obj.subject === "string" && obj.subject.trim()
+        ? safeTrim(obj.subject.trim(), 120)
+        : `Request to cancel ${subscriptionName}`;
+
+    const body =
+      typeof obj.body === "string" && obj.body.trim()
+        ? safeTrim(obj.body.trim(), 2000)
+        : `Hello ${subscriptionName} Support,\n\nPlease cancel my subscription effective immediately and stop all future charges.\n\nPlease confirm cancellation in writing.\n\nThank you,\nCustomer`;
+
+    return res.json({ subject, body });
   } catch (err) {
     const status = err?.statusCode || 500;
-    console.error("deleteMyData error:", err);
-    res.status(status).json({ error: "Server error", message: String(err?.message || err) });
+    console.error("draft-cancel-email error:", err);
+    return res.status(status).json({
+      error: status === 500 ? "Server error" : String(err?.message || err),
+      raw: err?.raw || undefined,
+    });
   }
 });
 
+/**
+ * ---- 404
+ */
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+
+/**
+ * ---- Start
+ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ Server listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Cancel Compass server listening on port ${PORT}`));
