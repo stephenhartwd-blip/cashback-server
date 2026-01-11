@@ -21,7 +21,7 @@ app.use((req, res, next) => {
 /**
  * ---- Middleware
  */
-app.use(express.json({ limit: "200kb" }));
+app.use(express.json({ limit: "500kb" }));
 app.use(helmet());
 app.use(cors({ origin: "*" }));
 
@@ -52,7 +52,7 @@ function getOpenAIClient() {
 /**
  * ---- Helpers
  */
-function safeTrim(s, n = 600) {
+function safeTrim(s, n = 1200) {
   if (typeof s !== "string") return "";
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
@@ -245,6 +245,133 @@ Requirements:
   } catch (err) {
     const status = err?.statusCode || 500;
     console.error("draft-cancel-email error:", err);
+    return res.status(status).json({
+      error: status === 500 ? "Server error" : String(err?.message || err),
+      raw: err?.raw || undefined,
+    });
+  }
+});
+
+/**
+ * POST /api/cancel-assist
+ * Returns:
+ * - suggested support email + cancellation URL (best-effort)
+ * - AND a drafted cancel email (subject/body)
+ *
+ * This endpoint is intentionally "suggestion-only" because models can be wrong.
+ * The iOS app should let the user edit before sending.
+ */
+app.post("/api/cancel-assist", async (req, res) => {
+  try {
+    const subscriptionName = String(req.body?.subscriptionName || "").trim();
+    const countryCode = normCountryCode(req.body?.countryCode);
+    const userName = String(req.body?.userName || "").trim();
+    const accountEmail = String(req.body?.accountEmail || "").trim();
+
+    if (!subscriptionName) {
+      return res.status(400).json({ error: "subscriptionName is required" });
+    }
+
+    const lookupPrompt = `
+You help users cancel subscriptions.
+
+Return ONLY JSON:
+{
+  "supportEmail": string|null,
+  "cancelURL": string|null,
+  "confidence": number,
+  "notes": string
+}
+
+Rules:
+- If uncertain, set fields to null and confidence <= 0.30.
+- supportEmail must be a plausible support/billing email for this company.
+- cancelURL must be the official cancellation / subscription management page URL.
+- Do NOT invent if unsure; use null.
+- confidence must be 0.0 to 1.0.
+
+subscriptionName: ${JSON.stringify(subscriptionName)}
+countryCode: ${JSON.stringify(countryCode)}
+`.trim();
+
+    const openai = getOpenAIClient();
+
+    const lookupResp = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: lookupPrompt,
+    });
+
+    const lookupRaw = lookupResp.output_text || "";
+    const lookupObj = parseModelJSON(lookupRaw);
+
+    const supportEmail =
+      typeof lookupObj.supportEmail === "string" && lookupObj.supportEmail.trim()
+        ? lookupObj.supportEmail.trim()
+        : null;
+
+    const cancelURL =
+      typeof lookupObj.cancelURL === "string" && lookupObj.cancelURL.trim()
+        ? lookupObj.cancelURL.trim()
+        : null;
+
+    const confidence = clamp01(toNumberOrNull(lookupObj.confidence));
+    const notes = typeof lookupObj.notes === "string" ? safeTrim(lookupObj.notes, 240) : "";
+
+    // Draft email (reuse the same style you already had)
+    const draftPrompt = `
+You write short, clear cancellation emails.
+
+Return ONLY JSON:
+{
+  "subject": string,
+  "body": string
+}
+
+Context:
+- subscriptionName: ${JSON.stringify(subscriptionName)}
+- userName: ${JSON.stringify(userName || "")}
+- accountEmail: ${JSON.stringify(accountEmail || "")}
+- countryCode: ${JSON.stringify(countryCode)}
+- supportEmail (if known): ${JSON.stringify(supportEmail || "")}
+
+Requirements:
+- Be polite, direct, and request confirmation in writing.
+- If accountEmail is provided, include it in the body.
+- If userName is provided, sign with it; otherwise sign "Customer".
+- If cancelURL is present, include it as a helpful reference.
+`.trim();
+
+    const draftResp = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: draftPrompt,
+    });
+
+    const draftRaw = draftResp.output_text || "";
+    const draftObj = parseModelJSON(draftRaw);
+
+    const emailSubject =
+      typeof draftObj.subject === "string" && draftObj.subject.trim()
+        ? safeTrim(draftObj.subject.trim(), 120)
+        : `Request to cancel ${subscriptionName}`;
+
+    const emailBody =
+      typeof draftObj.body === "string" && draftObj.body.trim()
+        ? safeTrim(draftObj.body.trim(), 2400)
+        : `Hello ${subscriptionName} Support,\n\nPlease cancel my subscription effective immediately and stop all future charges.\n\nPlease confirm cancellation in writing.\n\nThank you,\nCustomer`;
+
+    return res.json({
+      subscriptionName,
+      countryCode,
+      supportEmail,
+      cancelURL,
+      confidence,
+      notes,
+      emailSubject,
+      emailBody,
+    });
+  } catch (err) {
+    const status = err?.statusCode || 500;
+    console.error("cancel-assist error:", err);
     return res.status(status).json({
       error: status === 500 ? "Server error" : String(err?.message || err),
       raw: err?.raw || undefined,
