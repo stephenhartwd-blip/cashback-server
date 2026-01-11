@@ -99,6 +99,65 @@ function normCountryCode(v) {
 }
 
 /**
+ * ✅ NEW: URL validation helpers (used ONLY by /api/cancel-contact)
+ * Goal: avoid returning dead cancelURL links that lead to 404.
+ */
+function ensureHttps(url) {
+  if (typeof url !== "string") return null;
+  const s = url.trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;
+  // If model returned something like "example.com/cancel", fix it.
+  if (/^[a-z0-9.-]+\.[a-z]{2,}\/?/i.test(s)) return `https://${s}`;
+  return s; // fallback; validation will likely fail and we’ll return a search link instead
+}
+
+function buildSearchURL(subscriptionName) {
+  const q = encodeURIComponent(`${subscriptionName} cancel subscription`);
+  return `https://duckduckgo.com/?q=${q}`;
+}
+
+async function validateCancelableURL(candidateURL) {
+  const url = ensureHttps(candidateURL);
+  if (!url) return { ok: false, finalUrl: null, status: 0 };
+
+  // Very small timeout so we don’t slow the app
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2500);
+
+  try {
+    // Try HEAD first (fast). Some sites block HEAD -> fallback to GET.
+    let resp = await fetch(url, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "user-agent": "CancelCompass/1.0" },
+    });
+
+    if (resp.status === 405 || resp.status === 403) {
+      resp = await fetch(url, {
+        method: "GET",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: { "user-agent": "CancelCompass/1.0" },
+      });
+    }
+
+    const status = resp.status || 0;
+    const finalUrl = resp.url || url;
+
+    // Treat 2xx/3xx as “safe enough”
+    const ok = status >= 200 && status < 400;
+
+    return { ok, finalUrl, status };
+  } catch (e) {
+    return { ok: false, finalUrl: null, status: 0, error: String(e?.message || e) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * ---- Simple in-memory cache (24h)
  */
 const PRICE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -188,7 +247,7 @@ countryCode: ${JSON.stringify(countryCode)}
 });
 
 /**
- * ✅ NEW: POST /api/cancel-contact
+ * ✅ POST /api/cancel-contact
  * Best-effort lookup for non-Apple subscriptions.
  * IMPORTANT: Always returns 200 so iOS never throws.
  *
@@ -252,13 +311,45 @@ countryCode: ${JSON.stringify(countryCode)}
         ? safeTrim(obj.email.trim(), 200)
         : null;
 
-    const cancelURL =
+    const modelCancelURL =
       typeof obj.cancelURL === "string" && obj.cancelURL.trim()
         ? safeTrim(obj.cancelURL.trim(), 500)
         : null;
 
-    const confidence = clamp01(toNumberOrNull(obj.confidence));
-    const notes = typeof obj.notes === "string" ? safeTrim(obj.notes, 240) : "";
+    let confidence = clamp01(toNumberOrNull(obj.confidence));
+    let notes = typeof obj.notes === "string" ? safeTrim(obj.notes, 240) : "";
+
+    // ✅ NEW: validate cancelURL to avoid sending users to 404 pages
+    let cancelURL = null;
+    if (modelCancelURL) {
+      const check = await validateCancelableURL(modelCancelURL);
+
+      if (check.ok && check.finalUrl) {
+        cancelURL = safeTrim(check.finalUrl, 500);
+      } else {
+        // URL looks dead or timed out — return a safe search link instead.
+        cancelURL = buildSearchURL(subscriptionName);
+
+        // Reduce confidence because we couldn’t verify the direct cancel page.
+        confidence = Math.min(confidence, 0.35);
+
+        const reason = check.status ? `status ${check.status}` : "unreachable";
+        notes = safeTrim(
+          (notes ? `${notes} ` : "") +
+            `Cancel link looked outdated (${reason}); returned a safe search link instead.`,
+          240
+        );
+
+        console.warn(
+          `cancel-contact: dead link for "${subscriptionName}" -> ${modelCancelURL} (${reason})`
+        );
+      }
+    } else {
+      // If no cancelURL at all, give a safe search link (better than null for UX)
+      cancelURL = buildSearchURL(subscriptionName);
+      confidence = Math.min(confidence, 0.30);
+      notes = safeTrim((notes ? `${notes} ` : "") + "No official cancel URL found; returned a safe search link.", 240);
+    }
 
     return res.status(200).json({ email, cancelURL, confidence, notes });
   } catch (err) {
