@@ -39,7 +39,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
 /**
- * ---- OpenAI client
+ * ---- Clients
  */
 function getOpenAIClient() {
   if (!OPENAI_API_KEY) {
@@ -113,7 +113,7 @@ const draftLimiter = rateLimit({
 });
 
 /**
- * ---- Simple in-memory cache (24 hours) to reduce costs
+ * ---- Simple in-memory cache (24h) to reduce OpenAI calls
  * Keyed by: subscriptionName|countryCode
  */
 const PRICE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -122,7 +122,10 @@ const priceCache = new Map(); // key -> { expiresAt, value }
 /**
  * POST /api/price-suggest
  * Body: { subscriptionName: string, countryCode?: string }
- * Returns: { monthly, currency, plan, confidence, notes, verifiedAt }
+ * Response:
+ * {
+ *   subscriptionName, countryCode, monthly, currency, plan, confidence, notes, verifiedAt, cacheHit
+ * }
  */
 app.post("/api/price-suggest", priceLimiter, async (req, res) => {
   try {
@@ -136,6 +139,7 @@ app.post("/api/price-suggest", priceLimiter, async (req, res) => {
     const cacheKey = `${subscriptionName.toLowerCase()}|${countryCode}`;
     const cached = priceCache.get(cacheKey);
     const now = Date.now();
+
     if (cached && cached.expiresAt > now) {
       return res.json({ ...cached.value, cacheHit: true });
     }
@@ -206,7 +210,7 @@ countryCode: ${JSON.stringify(countryCode)}
 /**
  * POST /api/draft-cancel-email
  * Body: { subscriptionName: string, userName?: string, accountEmail?: string, reason?: string }
- * Returns: { subject, body }
+ * Response: { subject, body }
  */
 app.post("/api/draft-cancel-email", draftLimiter, async (req, res) => {
   try {
@@ -256,7 +260,7 @@ Requirements:
 
     const body =
       typeof obj.body === "string" && obj.body.trim()
-        ? safeTrim(obj.body.trim(), 2000)
+        ? safeTrim(obj.body.trim(), 2200)
         : `Hello ${subscriptionName} Support,\n\nPlease cancel my subscription effective immediately and stop all future charges.\n\nPlease confirm cancellation in writing.\n\nThank you,\nCustomer`;
 
     return res.json({ subject, body });
