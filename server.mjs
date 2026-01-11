@@ -188,17 +188,141 @@ countryCode: ${JSON.stringify(countryCode)}
 });
 
 /**
- * POST /api/draft-cancel-email
+ * ✅ NEW: POST /api/cancel-contact
+ * Best-effort lookup for non-Apple subscriptions.
+ * IMPORTANT: Always returns 200 so iOS never throws.
+ *
+ * Returns ONLY:
+ * {
+ *   email: string|null,
+ *   cancelURL: string|null,
+ *   confidence: number,
+ *   notes: string
+ * }
  */
-app.post("/api/draft-cancel-email", async (req, res) => {
+app.post("/api/cancel-contact", async (req, res) => {
+  // Always 200 response (never fail the app flow)
   try {
     const subscriptionName = String(req.body?.subscriptionName || "").trim();
-    const userName = String(req.body?.userName || "").trim();
-    const accountEmail = String(req.body?.accountEmail || "").trim();
-    const reason = String(req.body?.reason || "").trim();
+    const countryCode = normCountryCode(req.body?.countryCode);
 
     if (!subscriptionName) {
-      return res.status(400).json({ error: "subscriptionName is required" });
+      return res.status(200).json({
+        email: null,
+        cancelURL: null,
+        confidence: 0.0,
+        notes: "subscriptionName is required",
+      });
+    }
+
+    const prompt = `
+You help users cancel subscriptions.
+
+Return ONLY JSON:
+{
+  "email": string|null,
+  "cancelURL": string|null,
+  "confidence": number,
+  "notes": string
+}
+
+Rules:
+- If uncertain, set fields to null and confidence <= 0.30.
+- email must be a plausible support/billing/cancellations email for this company (only if confident).
+- cancelURL must be the official cancellation / subscription management page URL (only if confident).
+- Do NOT invent if unsure; use null.
+- confidence must be 0.0 to 1.0.
+
+subscriptionName: ${JSON.stringify(subscriptionName)}
+countryCode: ${JSON.stringify(countryCode)}
+`.trim();
+
+    const openai = getOpenAIClient();
+
+    const resp = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: prompt,
+    });
+
+    const raw = resp.output_text || "";
+    const obj = parseModelJSON(raw);
+
+    const email =
+      typeof obj.email === "string" && obj.email.trim()
+        ? safeTrim(obj.email.trim(), 200)
+        : null;
+
+    const cancelURL =
+      typeof obj.cancelURL === "string" && obj.cancelURL.trim()
+        ? safeTrim(obj.cancelURL.trim(), 500)
+        : null;
+
+    const confidence = clamp01(toNumberOrNull(obj.confidence));
+    const notes = typeof obj.notes === "string" ? safeTrim(obj.notes, 240) : "";
+
+    return res.status(200).json({ email, cancelURL, confidence, notes });
+  } catch (err) {
+    console.error("cancel-contact error:", err);
+    // Never non-2xx
+    return res.status(200).json({
+      email: null,
+      cancelURL: null,
+      confidence: 0.0,
+      notes: "Lookup unavailable right now — generating a cancel email draft instead.",
+    });
+  }
+});
+
+/**
+ * POST /api/draft-cancel-email
+ * ✅ Updated: Always returns 200 with a usable draft (never fails iOS flow)
+ */
+app.post("/api/draft-cancel-email", async (req, res) => {
+  // Build a safe fallback draft first
+  const subscriptionName = String(req.body?.subscriptionName || "").trim();
+  const userName = String(req.body?.userName || "").trim();
+  const accountEmail = String(req.body?.accountEmail || "").trim();
+  const reason = String(req.body?.reason || "").trim();
+
+  const fallbackSubject = subscriptionName
+    ? `Request to cancel ${subscriptionName}`
+    : "Request to cancel subscription";
+
+  const fallbackBody = (() => {
+    const sign = userName ? userName : "Customer";
+    const lines = [];
+
+    lines.push(`Hello Support,`);
+    lines.push("");
+    if (subscriptionName) {
+      lines.push(`Please cancel my ${subscriptionName} subscription effective immediately and stop all future charges.`);
+    } else {
+      lines.push("Please cancel my subscription effective immediately and stop all future charges.");
+    }
+
+    if (accountEmail) {
+      lines.push("");
+      lines.push(`Account email: ${accountEmail}`);
+    }
+
+    if (reason) {
+      lines.push("");
+      lines.push(`Reason: ${reason}`);
+    }
+
+    lines.push("");
+    lines.push("Please confirm cancellation in writing.");
+    lines.push("");
+    lines.push("Thank you,");
+    lines.push(sign);
+
+    return lines.join("\n");
+  })();
+
+  try {
+    if (!subscriptionName) {
+      // Still return 200 (so client doesn't throw)
+      return res.status(200).json({ subject: fallbackSubject, body: fallbackBody });
     }
 
     const prompt = `
@@ -234,21 +358,19 @@ Requirements:
     const subject =
       typeof obj.subject === "string" && obj.subject.trim()
         ? safeTrim(obj.subject.trim(), 120)
-        : `Request to cancel ${subscriptionName}`;
+        : fallbackSubject;
 
     const body =
       typeof obj.body === "string" && obj.body.trim()
         ? safeTrim(obj.body.trim(), 2200)
-        : `Hello ${subscriptionName} Support,\n\nPlease cancel my subscription effective immediately and stop all future charges.\n\nPlease confirm cancellation in writing.\n\nThank you,\nCustomer`;
+        : fallbackBody;
 
-    return res.json({ subject, body });
+    // Always 200
+    return res.status(200).json({ subject, body });
   } catch (err) {
-    const status = err?.statusCode || 500;
     console.error("draft-cancel-email error:", err);
-    return res.status(status).json({
-      error: status === 500 ? "Server error" : String(err?.message || err),
-      raw: err?.raw || undefined,
-    });
+    // Always 200 with fallback draft
+    return res.status(200).json({ subject: fallbackSubject, body: fallbackBody });
   }
 });
 
