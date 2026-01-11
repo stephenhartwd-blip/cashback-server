@@ -2,14 +2,13 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 
 const app = express();
-app.set("trust proxy", 1); // Render is behind a proxy
+app.set("trust proxy", 1);
 
 /**
- * ---- Request logging (shows in Render Logs)
+ * ---- Request logging
  */
 app.use((req, res, next) => {
   const start = Date.now();
@@ -24,7 +23,7 @@ app.use((req, res, next) => {
  */
 app.use(express.json({ limit: "200kb" }));
 app.use(helmet());
-app.use(cors({ origin: "*" })); // tighten later if you want
+app.use(cors({ origin: "*" }));
 
 /**
  * ---- Health
@@ -39,7 +38,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
 /**
- * ---- Clients
+ * ---- OpenAI client
  */
 function getOpenAIClient() {
   if (!OPENAI_API_KEY) {
@@ -100,34 +99,15 @@ function normCountryCode(v) {
 }
 
 /**
- * ---- Rate limits
- */
-const priceLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60, // 60 req/min per IP
-});
-
-const draftLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-});
-
-/**
- * ---- Simple in-memory cache (24h) to reduce OpenAI calls
- * Keyed by: subscriptionName|countryCode
+ * ---- Simple in-memory cache (24h)
  */
 const PRICE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const priceCache = new Map(); // key -> { expiresAt, value }
+const priceCache = new Map();
 
 /**
  * POST /api/price-suggest
- * Body: { subscriptionName: string, countryCode?: string }
- * Response:
- * {
- *   subscriptionName, countryCode, monthly, currency, plan, confidence, notes, verifiedAt, cacheHit
- * }
  */
-app.post("/api/price-suggest", priceLimiter, async (req, res) => {
+app.post("/api/price-suggest", async (req, res) => {
   try {
     const subscriptionName = String(req.body?.subscriptionName || "").trim();
     const countryCode = normCountryCode(req.body?.countryCode);
@@ -209,10 +189,8 @@ countryCode: ${JSON.stringify(countryCode)}
 
 /**
  * POST /api/draft-cancel-email
- * Body: { subscriptionName: string, userName?: string, accountEmail?: string, reason?: string }
- * Response: { subject, body }
  */
-app.post("/api/draft-cancel-email", draftLimiter, async (req, res) => {
+app.post("/api/draft-cancel-email", async (req, res) => {
   try {
     const subscriptionName = String(req.body?.subscriptionName || "").trim();
     const userName = String(req.body?.userName || "").trim();
